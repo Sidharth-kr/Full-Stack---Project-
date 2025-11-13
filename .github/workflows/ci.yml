@@ -1,0 +1,260 @@
+gname: BuildRepl CI/CD Pipeline
+
+# 1. Controls when the action runs
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # --- JOB 1: RUN ALL BACKEND TESTS (UNIT + INTEGRATION) ---
+  backend-tests:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./backend # Run all commands in the 'backend' folder
+
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: 3. Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-backend-modules-${{ hashFiles('backend/package-lock.json') }}
+
+      - name: 4. Install Dependencies
+        run: npm install
+
+      # --- FIX: ADD EXECTUE PERMISSIONS ---
+      - name: 4a. Add Execute Permissions
+        run: chmod +x ./node_modules/.bin/jest
+
+      - name: 5. Run Backend Tests
+        # This runs all Jest tests (unit + integration)
+        # We added --coverage to enforce the coverage gate
+        run: npm test -- --coverage
+        env:
+          # Provide mock secrets for the test environment
+          MONGO_URI: "mongodb://localhost/testdb"
+          JWT_SECRET: "test-secret"
+          CLOUDINARY_CLOUD_NAME: "test"
+          CLOUDINARY_API_KEY: "test"
+          CLOUDINARY_API_SECRET: "test"
+          REDIS_URL: "redis://localhost:6379"
+
+      - name: Upload Backend Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage-report
+          path: backend/coverage/
+          if-no-files-found: warn
+
+  # --- JOB 2: RUN ALL FRONTEND TESTS (UNIT + INTERACTION) ---
+  frontend-tests:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./frontend # Run all commands in the 'frontend' folder
+
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: 3. Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-frontend-modules-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: 4. Clean install to avoid npm optional-deps bug
+        run: |
+          rm -f package-lock.json || true
+          rm -rf node_modules || true
+          npm install
+      
+      - name: 4b. Show resolved testing env
+        run: |
+          node -v
+          npm -v
+          node -e "import('./vite.config.js').then(m => console.log('env', m.default?.test?.environment || 'unknown'))"
+
+      - name: 5. Run Frontend Tests
+        run: npm test -- --run
+
+  # --- JOB 3: NEW LINTING JOB ---
+  linting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      # Cache and install for backend
+      - name: 3. Cache Backend Modules
+        uses: actions/cache@v4
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-backend-modules-${{ hashFiles('backend/package-lock.json') }}
+      - name: 4. Install Backend Dependencies
+        run: npm install
+        working-directory: ./backend
+
+      # --- FIX: ADD EXECTUE PERMISSIONS ---
+      - name: 4a. Add Backend Execute Permissions
+        run: chmod +x ./backend/node_modules/.bin/eslint
+
+      # Cache and install for frontend
+      - name: 5. Cache Frontend Modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-frontend-modules-${{ hashFiles('frontend/package-lock.json') }}
+      - name: 6. Install Frontend Dependencies
+        run: npm install
+        working-directory: ./frontend
+
+      # --- FIX: ADD EXECTUE PERMISSIONS ---
+      - name: 6a. Add Frontend Execute Permissions
+        run: chmod +x ./frontend/node_modules/.bin/eslint
+
+      # Run both linters
+      - name: 7. Run Backend Linter
+        run: npm run lint
+        working-directory: ./backend
+
+      - name: 8. Run Frontend Linter
+        run: npm run lint
+        working-directory: ./frontend
+
+  # --- JOB 4: SECURITY AUDIT (OWASP Gate) ---
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js v20.19
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+
+      # Backend audit
+      - name: 3. Install Backend Dependencies
+        run: npm install
+        working-directory: ./backend
+
+      - name: 4. Run Backend Security Audit (prod deps, moderate+)
+        run: npm audit --omit=dev --audit-level=moderate
+        working-directory: ./backend
+
+      # Frontend audit
+      - name: 5. Install Frontend Dependencies
+        run: npm install
+        working-directory: ./frontend
+
+      - name: 6. Run Frontend Security Audit (prod deps, moderate+)
+        run: npm audit --omit=dev --audit-level=moderate
+        working-directory: ./frontend
+
+  # --- JOB 5: RUN ALL E2E TESTS (CYPRESS) ---
+  e2e-tests:
+    runs-on: ubuntu-latest
+    
+    needs: [backend-tests, frontend-tests, linting, security-audit] 
+
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js v20.19
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+      
+      # Install dependencies for both frontend and backend
+      - name: 3. Install Frontend Dependencies (clean)
+        run: |
+          rm -f package-lock.json || true
+          rm -rf node_modules || true
+          npm install
+          node -v
+          npm -v
+        working-directory: ./frontend
+
+      - name: 4. Install Backend Dependencies
+        run: npm install
+        working-directory: ./backend
+
+      - name: 4b. Build Frontend (Node 20)
+        run: npm run build
+        working-directory: ./frontend
+      
+      - name: 5. Run Cypress E2E Tests
+        uses: cypress-io/github-action@v6
+        with:
+          working-directory: ./frontend 
+          install: false
+          build: echo "skip build"
+          start: |
+            npm --prefix ../backend start
+            npm run preview -- --host 127.0.0.1 --port 5173
+          wait-on: 'http://127.0.0.1:5173'
+          wait-on-timeout: 300
+          config: video=true
+        env:
+          USE_MEM_MONGO: "1"
+          JWT_SECRET: "test-secret"
+          CLOUDINARY_CLOUD_NAME: "test"
+          CLOUDINARY_API_KEY: "test"
+          CLOUDINARY_API_SECRET: "test"
+          REDIS_URL: "redis://localhost:6379"
+          CYPRESS_video: "true"
+
+      - name: Upload Cypress E2E Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-e2e-report
+          path: |
+            frontend/cypress/reports/**
+            frontend/cypress/screenshots/**
+            frontend/cypress/videos/**
+          if-no-files-found: warn
+
+  # --- JOB 6: DEPLOY TO PRODUCTION (CD) ---
+  deploy:
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js v20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+
+      - name: 3. Deploy
+        run: echo "Deploying to production..."
+
